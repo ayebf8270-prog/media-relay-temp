@@ -1,0 +1,13 @@
+name: Pinterest diagnose
+on:
+  push:
+    branches: [diag/pinterest]
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 diag/pin_diag.py
