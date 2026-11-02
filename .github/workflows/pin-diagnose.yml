@@ -10,4 +10,4 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - run: python3 diag/pin_diag3.py
+      - run: python3 diag/pin_diag4.py
