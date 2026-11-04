@@ -1,4 +1,6 @@
-// media-bridge v2.2.0 - secure MCP server for The Hidden Why media retrieval.
+// media-bridge v2.3.0 - secure MCP server for The Hidden Why media retrieval.
+// v2.3.0 adds generate_image: calls the Hugging Face Space mcp-tools/Z-Image-Turbo through its Gradio API
+// (host restricted to GEN_HOSTS) and, when the GitHub relay is configured, relays the result so the sandbox can download it.
 // v2.2.0 adds resolve_pinterest: follows pin.it / pinterest.com pin URLs (validated at every hop, page hosts
 // restricted to RESOLVER_HOSTS) and returns a direct video URL on an approved media host (v1.pinimg.com).
 // v2.1.0 adds relay_media / relay_cleanup: copy an approved media URL to a temporary GitHub Release
@@ -6,10 +8,11 @@
 // Runs on Cloudflare Workers FREE plan. No storage, no paid services.
 // Secrets (Worker "Variables and Secrets" -> Secret): ACCESS_TOKEN (required),
 // PEXELS_API_KEY and PIXABAY_API_KEY (optional), GITHUB_TOKEN and GITHUB_REPO (for relay only),
-// PINTEREST_USER_AGENT (optional override of the User-Agent used for Pinterest page requests).
+// PINTEREST_USER_AGENT (optional override of the User-Agent used for Pinterest page requests),
+// HF_TOKEN (optional, Hugging Face read token: gives generate_image your own ZeroGPU quota).
 // Never put secrets in this file.
 
-const VERSION = "2.2.0";
+const VERSION = "2.3.0";
 const CHUNK_DEFAULT = 65536;
 const CHUNK_MAX = 98304;
 const MAX_FILE_BYTES = 250 * 1024 * 1024;
@@ -20,15 +23,28 @@ const RESOLVER_MAX_REDIRECTS = 5;            // pin.it -> pinterest.com -> local
 const MAX_REDIRECTS = 3;
 const TIMEOUT_MS = 15000;
 const RELAY_TIMEOUT_MS = 180000;
+const GEN_TIMEOUT_MS = 170000;               // image generation can queue on ZeroGPU
 const RATE_LIMIT_PER_MIN = 1500;
 const UA = "TheHiddenWhyMediaBridge/2.0 (+https://media-bridge.fatehayeb17.workers.dev)";
 
 const API_HOSTS = ["commons.wikimedia.org", "archive.org", "api.pexels.com", "pixabay.com"];
-const MEDIA_HOSTS = ["upload.wikimedia.org", "archive.org", ".archive.org", "images.pexels.com", "videos.pexels.com", "cdn.pixabay.com", "v1.pinimg.com", "i.pinimg.com"];
+const MEDIA_HOSTS = ["upload.wikimedia.org", "archive.org", ".archive.org", "images.pexels.com", "videos.pexels.com", "cdn.pixabay.com", "v1.pinimg.com", "i.pinimg.com", "mcp-tools-z-image-turbo.hf.space"];
 // Hosts the Pinterest resolver may fetch HTML pages from. Deliberately NOT part of MEDIA_HOSTS, so
 // probe_media / fetch_chunk / relay_media can never be used on Pinterest pages. ".pinterest.com" matches
 // subdomains only (the leading dot is required), so "evilpinterest.com" does not match.
 const RESOLVER_HOSTS = ["pin.it", "pinterest.com", ".pinterest.com"];
+
+// Image generation (Hugging Face Space mcp-tools/Z-Image-Turbo, Gradio api_name "generate").
+const GEN_BASE = "https://mcp-tools-z-image-turbo.hf.space";
+const GEN_HOSTS = ["mcp-tools-z-image-turbo.hf.space"];
+const GEN_RESOLUTIONS = [
+  "1024x1024 ( 1:1 )", "1152x896 ( 9:7 )", "896x1152 ( 7:9 )", "1152x864 ( 4:3 )", "864x1152 ( 3:4 )", "1248x832 ( 3:2 )",
+  "832x1248 ( 2:3 )", "1280x720 ( 16:9 )", "720x1280 ( 9:16 )", "1344x576 ( 21:9 )", "576x1344 ( 9:21 )",
+  "1280x1280 ( 1:1 )", "1440x1120 ( 9:7 )", "1120x1440 ( 7:9 )", "1472x1104 ( 4:3 )", "1104x1472 ( 3:4 )", "1536x1024 ( 3:2 )",
+  "1024x1536 ( 2:3 )", "1536x864 ( 16:9 )", "864x1536 ( 9:16 )", "1680x720 ( 21:9 )", "720x1680 ( 9:21 )",
+  "1536x1536 ( 1:1 )", "1728x1344 ( 9:7 )", "1344x1728 ( 7:9 )", "1728x1296 ( 4:3 )", "1296x1728 ( 3:4 )", "1872x1248 ( 3:2 )",
+  "1248x1872 ( 2:3 )", "2048x1152 ( 16:9 )", "1152x2048 ( 9:16 )", "2016x864 ( 21:9 )", "864x2016 ( 9:21 )",
+];
 
 const SIGNATURES = [
   ["jpeg", [0xff, 0xd8, 0xff]], ["png", [0x89, 0x50, 0x4e, 0x47]], ["gif", [0x47, 0x49, 0x46, 0x38]],
@@ -144,6 +160,8 @@ const TOOLS = [
     inputSchema: { type: "object", properties: { asset_id: { type: "integer", minimum: 1 } }, required: ["asset_id"], additionalProperties: false } },
   { name: "resolve_pinterest", description: "Resolve a Pinterest pin (pin.it short link or pinterest.com/pin/<id> URL) to its direct video file. Follows redirects with every hop validated against an allowlist. Output JSON: pin_id, pin_url, title, description, duration_seconds, width, height, thumbnail_url, video {url, variant, size_bytes, content_type, relay_eligible}, alternatives, next_step. Pass video.url to relay_media to download. Errors: pin_not_found, pin_unavailable (private/blocked), no_video, unsupported_url, unsupported_video_format, unsupported_media_host, video_unavailable, host_not_allowed, blocked_host, too_many_redirects.",
     inputSchema: { type: "object", properties: { url: { type: "string", maxLength: 1000 } }, required: ["url"], additionalProperties: false } },
+  { name: "generate_image", description: "Generate an image from a text prompt with the Hugging Face Space mcp-tools/Z-Image-Turbo (free; may queue for up to a couple of minutes). Output JSON: image_url (temporary link on the Space), seed_info, and, when the GitHub relay is configured and relay is true, relay {download_url, asset_id, size, sha256}: download it from github.com, verify, then call relay_cleanup with asset_id. Errors: invalid_input, space_unavailable, quota_or_queue_error, generation_failed, not_configured (only for the relay).",
+    inputSchema: { type: "object", properties: { prompt: { type: "string", minLength: 1, maxLength: 2000 }, resolution: { type: "string", enum: GEN_RESOLUTIONS }, seed: { type: "integer", minimum: 0, maximum: 2147483647 }, shift: { type: "number", minimum: 1, maximum: 10 }, relay: { type: "boolean" } }, required: ["prompt"], additionalProperties: false } },
 ];
 
 async function apiJson(url, headers = {}) {
@@ -454,6 +472,65 @@ async function relayCleanup(env, { asset_id }) {
   return { deleted: r.status === 204, already_gone: r.status === 404 };
 }
 
+// ---------- image generation (v2.3.0) ----------
+// Gradio "call" API of the Space: POST /gradio_api/call/generate -> {event_id}; GET .../generate/<event_id> -> SSE stream.
+// Input order (from the Space's app.py click handler): [prompt, resolution, seed, steps, shift, random_seed].
+function parseSse(text) {
+  let ev = null, complete = null, error = null;
+  for (const raw of String(text).split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("event:")) ev = line.slice(6).trim();
+    else if (line.startsWith("data:")) {
+      const d = line.slice(5).trim();
+      if (ev === "complete") complete = d;
+      else if (ev === "error") error = d;
+    }
+  }
+  return { complete, error };
+}
+
+async function generateImage(env, { prompt, resolution = "1024x1024 ( 1:1 )", seed, shift = 3, relay = true }) {
+  if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 2000) throw new BridgeError("invalid_input", "prompt must be a non-empty string of at most 2000 characters");
+  if (!GEN_RESOLUTIONS.includes(resolution)) throw new BridgeError("invalid_input", "resolution must be one of the supported values listed in the tool schema");
+  const randomSeed = !Number.isInteger(seed);
+  const shiftVal = Math.max(1, Math.min(10, Number.isFinite(+shift) ? +shift : 3));
+  const auth = env.HF_TOKEN ? { Authorization: "Bearer " + env.HF_TOKEN } : {};
+  const data = [prompt.trim(), resolution, randomSeed ? 42 : seed, 8, shiftVal, randomSeed];
+
+  const { res: start } = await guardedFetch(GEN_BASE + "/gradio_api/call/generate",
+    { method: "POST", headers: { "User-Agent": UA, "Content-Type": "application/json", ...auth }, body: JSON.stringify({ data }) }, GEN_HOSTS, TIMEOUT_MS);
+  if (!start.ok) { start.body?.cancel(); throw new BridgeError("space_unavailable", "the Space returned HTTP " + start.status + " (it may be sleeping, restarting or over quota); try again shortly"); }
+  const started = await start.json().catch(() => null);
+  const eventId = started?.event_id;
+  if (typeof eventId !== "string" || !/^[A-Za-z0-9_-]{4,100}$/.test(eventId)) throw new BridgeError("space_unavailable", "the Space did not return a valid event_id");
+
+  const { res: stream } = await guardedFetch(GEN_BASE + "/gradio_api/call/generate/" + eventId,
+    { headers: { "User-Agent": UA, Accept: "text/event-stream", ...auth } }, GEN_HOSTS, GEN_TIMEOUT_MS);
+  if (!stream.ok) { stream.body?.cancel(); throw new BridgeError("space_unavailable", "the Space returned HTTP " + stream.status + " while generating"); }
+  const { complete, error } = parseSse(await stream.text());
+  if (!complete) {
+    const msg = (error && error !== "null" ? error : "no result returned").slice(0, 300);
+    throw new BridgeError(/quota|queue|GPU|limit/i.test(msg) ? "quota_or_queue_error" : "generation_failed", msg);
+  }
+  let out;
+  try { out = JSON.parse(complete); } catch { throw new BridgeError("generation_failed", "could not parse the Space response"); }
+  const img = Array.isArray(out) ? out[0] : null;
+  const rawUrl = img?.url || (img?.path ? GEN_BASE + "/gradio_api/file=" + img.path : null);
+  if (!rawUrl) throw new BridgeError("generation_failed", "the Space returned no image");
+  const imageUrl = validateUrl(rawUrl, GEN_HOSTS).toString();
+
+  const result = { source: "z-image-turbo", prompt: prompt.trim(), resolution, seed_info: typeof out[1] === "string" ? out[1] : null, image_url: imageUrl,
+    note: "image_url is temporary and lives on the Space; relay it (relay_media) or use the relay field if present." };
+  if (relay && env.GITHUB_TOKEN && env.GITHUB_REPO) {
+    const ext = (/\.(webp|png|jpe?g)(?:[?#]|$)/i.exec(new URL(imageUrl).pathname)?.[1] || "webp").toLowerCase();
+    try { result.relay = await relayMedia(env, { src: imageUrl, name: `zimage_${Date.now()}.${ext}` }); }
+    catch (e) { result.relay_error = e instanceof BridgeError ? { error: e.code, message: e.message } : { error: "internal_error" }; }
+  } else if (relay) {
+    result.next_step = { tool: "relay_media", src: imageUrl, suggested_name: "zimage.webp" };
+  }
+  return result;
+}
+
 async function callTool(env, name, a = {}) {
   switch (name) {
     case "hello": return "media-bridge MCP is working. Ready for media search integration.";
@@ -468,6 +545,7 @@ async function callTool(env, name, a = {}) {
     case "relay_media": return relayMedia(env, a);
     case "relay_cleanup": return relayCleanup(env, a);
     case "resolve_pinterest": return resolvePinterest(env, a);
+    case "generate_image": return generateImage(env, a);
     default: throw new BridgeError("unknown_tool", "Unknown tool");
   }
 }

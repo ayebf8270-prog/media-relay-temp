@@ -1,10 +1,10 @@
-name: Deploy media-bridge (Cloudflare API)
+name: Deploy media-bridge v2.3.0 (Cloudflare API)
 
 # Runs only on pushes to the dedicated deploy branch. The default branch and the media relay
-# release workflow are never touched.
+# release workflow are never touched. Tests run first; the deploy step only runs if they pass.
 on:
   push:
-    branches: [deploy/media-bridge-v2.2.0]
+    branches: [deploy/media-bridge-v2.3.0]
     paths:
       - "deploy/media-bridge/**"
       - ".github/workflows/deploy-media-bridge.yml"
@@ -24,8 +24,19 @@ jobs:
       CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CF_ACCOUNT_OVERRIDE: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       SCRIPT_NAME: media-bridge
-      EXPECT_VERSION: "2.2.0"
+      EXPECT_VERSION: "2.3.0"
+      ROLLBACK_VERSION: "2.2.0"
     steps:
       - uses: actions/checkout@v4
-      - name: Deploy via Cloudflare API (code only; bindings untouched) and verify
+      - name: Syntax check and regression tests (no network, no secrets used)
+        env:
+          CF_TOKEN: ""
+          CF_ACCOUNT_OVERRIDE: ""
+        run: |
+          T="$RUNNER_TEMP/t"; mkdir -p "$T"
+          cp deploy/media-bridge/worker.js "$T/new.mjs"
+          cp deploy/media-bridge/rollback-v2.2.0.js "$T/old.mjs"
+          node --check "$T/new.mjs"
+          NEW="$T/new.mjs" OLD="$T/old.mjs" node deploy/media-bridge/test.mjs
+      - name: Deploy via Cloudflare API (code only; bindings untouched), verify, auto-rollback on failure
         run: bash deploy/media-bridge/deploy.sh
