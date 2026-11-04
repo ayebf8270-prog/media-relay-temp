@@ -1,0 +1,40 @@
+name: Fetch Pinterest videos
+on:
+  push:
+    branches: [fetch/pinterest-refs]
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Install gallery-dl and yt-dlp
+        run: pip install -U gallery-dl yt-dlp 2>&1 | tail -2
+      - name: Download (gallery-dl first, yt-dlp fallback per pin)
+        run: |
+          set +e   # keep going so the real error messages are visible
+          mkdir -p out
+          for id in 1086986060083566595 1086986060093080346 1086986060082670976; do
+            url="https://es.pinterest.com/pin/$id/"
+            echo "=============== $id ==============="
+            gallery-dl --write-metadata -D out -f "pin_${id}.{extension}" "$url" 2>&1 | tail -15
+            if ! ls out/pin_${id}.* 2>/dev/null | grep -qiE '\.(mp4|mov|webm|m4v)$'; then
+              echo "--- no video from gallery-dl for $id, trying yt-dlp ---"
+              yt-dlp -f "bv*+ba/b" --no-merge-output-format -o "out/pin_${id}.%(ext)s" --write-info-json "$url" 2>&1 | tail -15
+            fi
+          done
+          echo; echo "=============== FILES ==============="
+          ls -laR out
+      - name: Publish as temporary prerelease
+        run: |
+          set +e
+          TAG="pin-fetch-${{ github.run_id }}"
+          mapfile -t FILES < <(find out -type f)
+          echo "tag=$TAG files=${#FILES[@]}"
+          [ "${#FILES[@]}" -gt 0 ] || { echo "::error title=No files::nothing was downloaded"; exit 1; }
+          gh release create "$TAG" "${FILES[@]}" --prerelease --title "$TAG" --notes "temporary, deleted after download" 2>&1
+          echo "::notice title=Release::$TAG"
