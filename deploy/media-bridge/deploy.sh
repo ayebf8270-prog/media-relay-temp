@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Deploys deploy/media-bridge/worker.js (v2.3.0) to the existing Cloudflare Worker via the API.
+# Deploys deploy/media-bridge/worker.js (v2.4.0) to the existing Cloudflare Worker via the API.
 # PUT /content replaces code only: bindings, secrets, variables and settings are not modified.
 # Safety: guards before the upload; bindings/settings compared before and after; live code verified afterwards;
-# automatic rollback to the known-good previous version (rollback-v2.2.0.js) if anything fails after the upload starts.
+# automatic rollback to the known-good previous version (rollback-v2.3.0.js) if anything fails after the upload starts.
 set -uo pipefail
 : "${CF_TOKEN:?missing}"
 SCRIPT_NAME="${SCRIPT_NAME:-media-bridge}"
-EXPECT_VERSION="${EXPECT_VERSION:-2.3.0}"
-ROLLBACK_VERSION="${ROLLBACK_VERSION:-2.2.0}"
+EXPECT_VERSION="${EXPECT_VERSION:-2.4.0}"
+ROLLBACK_VERSION="${ROLLBACK_VERSION:-2.3.0}"
 CF_API="${CF_API:-https://api.cloudflare.com/client/v4}"
 SRC="${SRC:-deploy/media-bridge/worker.js}"
-ROLLBACK_SRC="${ROLLBACK_SRC:-deploy/media-bridge/rollback-v2.2.0.js}"
+ROLLBACK_SRC="${ROLLBACK_SRC:-deploy/media-bridge/rollback-v2.3.0.js}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-5}"
-OLD_TOOLS="hello search_commons commons_info search_archive archive_files search_pexels search_pixabay probe_media fetch_chunk relay_media relay_cleanup resolve_pinterest"
-NEW_TOOLS="generate_image"
+OLD_TOOLS="hello search_commons commons_info search_archive archive_files search_pexels search_pixabay probe_media fetch_chunk relay_media relay_cleanup resolve_pinterest generate_image"
+NEW_TOOLS=""
 W="$(mktemp -d)"; BASE=""; UPLOADED=0; ROLLED_BACK=0
 META='metadata={"main_module":"worker.js"};type=application/json'
 
@@ -92,4 +92,4 @@ sleep "$SETTLE_SECONDS"
 cf GET "$BASE/content/v2" > "$W/live_after.js"
 [ "$(version_of "$W/live_after.js")" = "$EXPECT_VERSION" ] || fail "Verify" "live code is not v$EXPECT_VERSION"
 m=$(missing_tools "$W/live_after.js" $OLD_TOOLS $NEW_TOOLS); [ -z "$m" ] || fail "Verify" "live code lacks tools: $m"
-notice "RESULT" "LIVE CODE IS v$EXPECT_VERSION; all 12 existing tools + generate_image present; bindings unchanged"
+notice "RESULT" "LIVE CODE IS v$EXPECT_VERSION; all 13 tools present; bindings unchanged"
