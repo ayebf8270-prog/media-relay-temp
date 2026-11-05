@@ -1,0 +1,5 @@
+name = "media-bridge"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+# Secrets (set in the dashboard or with `wrangler secret put`; never commit them):
+# ACCESS_TOKEN, PEXELS_API_KEY, PIXABAY_API_KEY, GITHUB_TOKEN, GITHUB_REPO, PINTEREST_USER_AGENT, HF_TOKEN

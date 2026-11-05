@@ -1,0 +1,8 @@
+{
+  "name": "media-bridge",
+  "version": "2.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Secure MCP server (Cloudflare Worker) for media retrieval, Pinterest video resolution and GitHub-release relay.",
+  "scripts": { "test": "node --test \"test/*.test.js\"" }
+}
