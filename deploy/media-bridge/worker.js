@@ -1,4 +1,6 @@
-// media-bridge v2.4.1 - secure MCP server for The Hidden Why media retrieval.
+// media-bridge v2.4.2 - secure MCP server for The Hidden Why media retrieval.
+// v2.4.2: when the pin page carries no usable video, Pinterest's widget JSON endpoint (widgets.pinterest.com/v3/pidgets/pins/info) is
+// tried for the same pin id, and no_video / pin_unavailable errors now say what the page contained (sizes and flags only, no page text).
 // v2.4.1: when a redirect chain passes through exactly one /pin/<id> but ends elsewhere (Pinterest sometimes bounces a pin's
 // /sent/ share page to the home page), the canonical https://www.pinterest.com/pin/<id>/ page is fetched once instead.
 // v2.4.0 hardens resolve_pinterest: redirect-chain tracing, descriptive unsupported_url errors (board / profile / login wall),
@@ -16,7 +18,7 @@
 // HF_TOKEN (optional, Hugging Face read token: gives generate_image your own ZeroGPU quota).
 // Never put secrets in this file.
 
-const VERSION = "2.4.1";
+const VERSION = "2.4.2";
 const CHUNK_DEFAULT = 65536;
 const CHUNK_MAX = 98304;
 const MAX_FILE_BYTES = 250 * 1024 * 1024;
@@ -450,10 +452,25 @@ async function fetchPinPage(env, start) {
   }
 }
 
+// Alternative source for the same pin: Pinterest's widget JSON endpoint. The URL is built from the numeric pin id on a fixed
+// host (inside RESOLVER_HOSTS); the answer is only used if it carries an entry whose id equals the requested pin id.
+async function widgetVideoList(pinId) {
+  try {
+    const { res } = await guardedFetch(`https://widgets.pinterest.com/v3/pidgets/pins/info/?pin_ids=${pinId}`,
+      { headers: { "User-Agent": UA, Accept: "application/json" } }, RESOLVER_HOSTS, TIMEOUT_MS, RESOLVER_MAX_REDIRECTS);
+    if (!res.ok) { try { res.body?.cancel(); } catch {} return { status: "http " + res.status }; }
+    const d = JSON.parse(new TextDecoder().decode(await readLimited(res, 1024 * 1024)));
+    const pin = Array.isArray(d?.data) ? d.data.find(x => String(x?.id) === pinId) : null;
+    const videoList = pin?.videos?.video_list;
+    return videoList && typeof videoList === "object" ? { status: "ok", pin, videoList } : { status: pin ? "pin without video" : "pin not in response" };
+  } catch (e) { return { status: e instanceof BridgeError ? e.code : "error" }; }
+}
+
 async function resolvePinterest(env, { url }) {
   const start = validateUrl(url, RESOLVER_HOSTS);
   const { pinId, html } = await fetchPinPage(env, start);
-  const { pin, videoList } = locatePin(jsonScriptBlocks(html), pinId);
+  const blocks = jsonScriptBlocks(html);
+  let { pin, videoList } = locatePin(blocks, pinId);
   const ogVideo = metaContent(html, "og:video:secure_url") || metaContent(html, "og:video:url") || metaContent(html, "og:video");
   const ogTitle = metaContent(html, "og:title"), ogImage = metaContent(html, "og:image");
 
@@ -461,10 +478,16 @@ async function resolvePinterest(env, { url }) {
   if (!variants.length && ogVideo && VIDEO_URL_RE.test(ogVideo)) {
     variants = [{ key: "og:video", url: ogVideo, width: +metaContent(html, "og:video:width") || null, height: +metaContent(html, "og:video:height") || null, duration_raw: null, thumbnail: null }];
   }
-  if (!pin && !variants.length && !ogTitle) throw new BridgeError("pin_unavailable", "no pin data found in the page: the pin may be private, deleted or region-restricted, or Pinterest changed its page layout");
+  let widget = null;
+  if (!variants.length) {                                   // v2.4.2: second source for the same pin id
+    widget = await widgetVideoList(pinId);
+    if (widget.status === "ok") { variants = rankVariants(widget.videoList); pin = pin || widget.pin; if (!videoList) videoList = widget.videoList; }
+  }
+  const diag = () => ` [page: ${html.length} chars, ${blocks.length} JSON blocks, pin object ${pin ? "found" : "not found"}, og:type=${metaContent(html, "og:type") || "none"}, og:video ${ogVideo ? "present" : "absent"}; widget endpoint: ${widget ? widget.status : "not needed"}]`;
+  if (!pin && !variants.length && !ogTitle) throw new BridgeError("pin_unavailable", "no pin data found in the page: the pin may be private, deleted or region-restricted, or Pinterest changed its page layout" + diag());
   if (!variants.length) {
     const hlsOnly = videoList && Object.values(videoList).some(v => v && typeof v.url === "string");
-    throw new BridgeError(hlsOnly ? "unsupported_video_format" : "no_video", hlsOnly ? "pin only offers streaming manifests (HLS), which cannot be relayed" : "pin has no video (image pin, or unsupported pin type)");
+    throw new BridgeError(hlsOnly ? "unsupported_video_format" : "no_video", (hlsOnly ? "pin only offers streaming manifests (HLS), which cannot be relayed" : "pin has no video (image pin, or unsupported pin type)") + diag());
   }
 
   let chosen = null, blockedHost = null;

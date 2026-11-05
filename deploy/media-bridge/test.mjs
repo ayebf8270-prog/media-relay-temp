@@ -1,4 +1,4 @@
-// Regression + behaviour tests for media-bridge v2.4.1. Offline: every network call is stubbed.
+// Regression + behaviour tests for media-bridge v2.4.2. Offline: every network call is stubbed.
 // Usage: NEW=/path/new.mjs OLD=/path/old.mjs node test.mjs
 import { pathToFileURL } from "node:url";
 import assert from "node:assert/strict";
@@ -32,12 +32,12 @@ const OLD_NAMES = ["hello","search_commons","commons_info","search_archive","arc
 noNetwork();
 const oldList = (await rpc(OLD, { jsonrpc: "2.0", id: 1, method: "tools/list" })).result.tools;
 const newList = (await rpc(NEW, { jsonrpc: "2.0", id: 1, method: "tools/list" })).result.tools;
-assert.deepEqual(oldList.map(t => t.name), OLD_NAMES); ok("previous worker (v2.4.0) exposes the 13 known tools");
+assert.deepEqual(oldList.map(t => t.name), OLD_NAMES); ok("previous worker (v2.4.1) exposes the 13 known tools");
 assert.deepEqual(newList.map(t => t.name), OLD_NAMES); ok("new worker = the same 13 tools in the same order");
 for (const t of oldList) assert.deepEqual(JSON.parse(JSON.stringify(newList.find(x => x.name === t.name))), JSON.parse(JSON.stringify(t)), "definition changed: " + t.name);
 ok("every existing tool definition (name, description, input schema) is byte-for-byte equivalent");
 const init = (await rpc(NEW, { jsonrpc: "2.0", id: 1, method: "initialize" })).result;
-assert.equal(init.serverInfo.version, "2.4.1"); ok("initialize reports 2.4.1");
+assert.equal(init.serverInfo.version, "2.4.2"); ok("initialize reports 2.4.2");
 assert.equal(textOf(await callTool(NEW, "hello", {})), textOf(await callTool(OLD, "hello", {}))); ok("hello unchanged");
 
 // ---- 2. access control and host allowlists behave identically for existing tools ----
@@ -144,9 +144,8 @@ const PIN2 = "1086986060095718307", HOME = "https://www.pinterest.com/";
 const bounce = { "https://pin.it/s": redir(`https://api.pinterest.com/url_shortener/s/redirect/`), "https://api.pinterest.com/url_shortener/s/redirect/": { status: 301, headers: { location: `https://www.pinterest.com/pin/${PIN2}/sent/?invite_code=zzz` } },
   [`https://www.pinterest.com/pin/${PIN2}/sent/?invite_code=zzz`]: { status: 301, headers: { location: HOME } }, [HOME]: { body: "<html>home</html>" } };
 net({ ...bounce, [`https://www.pinterest.com/pin/${PIN2}/`]: { body: page(PIN2) }, ...probeOk });
-let r4 = await resolve(OLD, "https://pin.it/s"); assert.equal(r4.error?.error, "unsupported_url");
-r4 = await resolve(NEW, "https://pin.it/s"); assert.equal(r4.pin_id, PIN2); assert.equal(r4.video.url, VID);
-ok("NEW: /sent/ bounced to the home page -> the pin id from the chain is used to fetch the canonical pin page (previous worker: unsupported_url)");
+for (const m of [OLD, NEW]) { const r4 = await resolve(m, "https://pin.it/s"); assert.equal(r4.pin_id, PIN2); assert.equal(r4.video.url, VID); }
+ok("/sent/ bounced to the home page -> the pin id from the chain is used to fetch the canonical pin page (v2.4.1 behaviour preserved)");
 
 net({ ...bounce, [`https://www.pinterest.com/pin/${PIN2}/`]: redir(HOME) });
 e = (await resolve(NEW, "https://pin.it/s")).error; assert.equal(e.error, "unsupported_url"); assert.match(e.message, /Retrying the canonical pin page also failed/); assert.ok(!e.message.includes("zzz"));
@@ -160,6 +159,40 @@ assert.equal((await resolve(NEW, "https://pin.it/s")).error.error, "pin_not_foun
 let calls = 0; globalThis.fetch = async u => { calls++; throw new Error("unexpected network call: " + u); };
 net({ "https://pin.it/b2": redir("https://www.pinterest.com/user/board/"), "https://www.pinterest.com/user/board/": { body: "<html>board</html>" } });
 assert.equal((await resolve(NEW, "https://pin.it/b2")).error.error, "unsupported_url"); ok("a board link (no pin id anywhere in the chain) makes no retry request");
+
+
+// ---- 6. v2.4.2: page without usable video -> widget JSON fallback; informative errors ----
+const noVideoPage = id => `<html><head><meta property="og:title" content="A pin"><meta property="og:type" content="article"><link rel="canonical" href="https://www.pinterest.com/pin/${id}/"></head><body><script type="application/json">${JSON.stringify({ pins: { [id]: { id, type: "pin", title: "A pin" } } })}</script></body></html>`;
+const WID = id => `https://widgets.pinterest.com/v3/pidgets/pins/info/?pin_ids=${id}`;
+const widgetJson = (id, vl) => ({ body: JSON.stringify({ status: "success", data: [{ id, videos: vl ? { video_list: vl } : undefined, title: "From widget" }] }), headers: { "content-type": "application/json" } });
+const PURL = `https://www.pinterest.com/pin/${PIN}/`;
+
+net({ [PURL]: { body: noVideoPage(PIN) }, [WID(PIN)]: widgetJson(PIN, { V_720P: { url: VID, width: 720, height: 1280, duration: 42167 } }), ...probeOk });
+r = await resolve(OLD, PURL); assert.equal(r.error?.error, "no_video");
+r = await resolve(NEW, PURL); assert.equal(r.pin_id, PIN); assert.equal(r.video.url, VID); assert.equal(r.duration_seconds, 42.167);
+ok("NEW: page without video data -> the widget endpoint supplies the video (previous worker: no_video)");
+
+let wcalls = 0; globalThis.fetch = async (u, i) => { if (String(u).includes("pidgets")) wcalls++; return (net_(u)); };
+const routes_ = { [PURL]: { body: page(PIN) }, ...probeOk }; const net_ = u => { const x = routes_[String(u)]; if (!x) throw new Error("unexpected network call: " + u); return new Response(x.body ?? "", { status: x.status ?? 200, headers: x.headers ?? { "content-type": "text/html" } }); };
+r = await resolve(NEW, PURL); assert.equal(r.pin_id, PIN); assert.equal(wcalls, 0); ok("the widget endpoint is NOT called when the page already has the video");
+
+net({ [PURL]: { body: noVideoPage(PIN) }, [WID(PIN)]: widgetJson("999999999999", { V_720P: { url: "https://v1.pinimg.com/other.mp4" } }) });
+e = (await resolve(NEW, PURL)).error; assert.equal(e.error, "no_video"); assert.match(e.message, /widget endpoint: pin not in response/);
+ok("SAFETY: a widget answer for a different pin id is ignored");
+
+net({ [PURL]: { body: noVideoPage(PIN) }, [WID(PIN)]: { status: 403 } });
+e = (await resolve(NEW, PURL)).error; assert.equal(e.error, "no_video");
+assert.match(e.message, /\[page: \d+ chars, 1 JSON blocks, pin object found, og:type=article, og:video absent; widget endpoint: http 403\]/);
+ok("no_video now reports what the page contained and why the widget fallback failed (no page text leaked)");
+
+net({ [PURL]: { body: noVideoPage(PIN) }, [WID(PIN)]: widgetJson(PIN, { V_720P: { url: "https://evil.example/v.mp4", width: 720, height: 1280 } }) });
+assert.equal((await resolve(NEW, PURL)).error.error, "unsupported_media_host"); ok("SAFETY: a widget video on an unapproved host is refused");
+
+net({ "https://pin.it/s": redir(`https://api.pinterest.com/url_shortener/s/redirect/`), "https://api.pinterest.com/url_shortener/s/redirect/": { status: 301, headers: { location: `https://www.pinterest.com/pin/${PIN}/sent/` } },
+  [`https://www.pinterest.com/pin/${PIN}/sent/`]: { status: 301, headers: { location: HOME } }, [HOME]: { body: "<html>home</html>" }, [PURL]: { body: noVideoPage(PIN) },
+  [WID(PIN)]: widgetJson(PIN, { V_720P: { url: VID, width: 720, height: 1280, duration: 34625 } }), ...probeOk });
+r = await resolve(NEW, "https://pin.it/s"); assert.equal(r.pin_id, PIN); assert.equal(r.duration_seconds, 34.625);
+ok("COMBINED link-2 shape: short link -> /sent/ bounced home -> canonical page without video -> widget endpoint -> video");
 
 globalThis.fetch = realFetch;
 console.log(`\nALL ${passed} TESTS PASSED`);
