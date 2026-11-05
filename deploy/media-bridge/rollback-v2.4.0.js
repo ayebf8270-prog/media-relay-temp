@@ -1,4 +1,6 @@
-// media-bridge v2.3.0 - secure MCP server for The Hidden Why media retrieval.
+// media-bridge v2.4.0 - secure MCP server for The Hidden Why media retrieval.
+// v2.4.0 hardens resolve_pinterest: redirect-chain tracing, descriptive unsupported_url errors (board / profile / login wall),
+// login-wall ?next= unwrapping, and a pin-id fallback from the page's own canonical / og:url / app-link tags.
 // v2.3.0 adds generate_image: calls the Hugging Face Space mcp-tools/Z-Image-Turbo through its Gradio API
 // (host restricted to GEN_HOSTS) and, when the GitHub relay is configured, relays the result so the sandbox can download it.
 // v2.2.0 adds resolve_pinterest: follows pin.it / pinterest.com pin URLs (validated at every hop, page hosts
@@ -12,7 +14,7 @@
 // HF_TOKEN (optional, Hugging Face read token: gives generate_image your own ZeroGPU quota).
 // Never put secrets in this file.
 
-const VERSION = "2.3.0";
+const VERSION = "2.4.0";
 const CHUNK_DEFAULT = 65536;
 const CHUNK_MAX = 98304;
 const MAX_FILE_BYTES = 250 * 1024 * 1024;
@@ -73,12 +75,16 @@ function validateUrl(raw, hosts) {
   return u;
 }
 
-async function guardedFetch(rawUrl, init, hosts, timeoutMs = TIMEOUT_MS, maxRedirects = MAX_REDIRECTS) {
+// Query strings are stripped from trace entries on purpose (they can carry invite codes / tokens).
+function traceUrl(u) { try { const x = new URL(u); return x.hostname + x.pathname; } catch { return "?"; } }
+
+async function guardedFetch(rawUrl, init, hosts, timeoutMs = TIMEOUT_MS, maxRedirects = MAX_REDIRECTS, trace = null) {
   let url = validateUrl(rawUrl, hosts).toString();
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const res = await fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+    trace?.push(res.status + " " + traceUrl(url));
     if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
-      if (hop === maxRedirects) throw new BridgeError("too_many_redirects", "redirect limit exceeded");
+      if (hop === maxRedirects) throw new BridgeError("too_many_redirects", "redirect limit exceeded" + (trace ? " via " + trace.join(" > ") : ""));
       const next = new URL(res.headers.get("location"), url).toString();
       url = validateUrl(next, hosts).toString();   // every hop re-validated
       continue;
@@ -280,18 +286,62 @@ async function fetchChunk({ url, offset, length }) {
     sha256: await sha256Hex(bytes), mime: ctype.split(";")[0], b64: toB64(bytes), done: total != null && offset + bytes.length >= total };
 }
 
-// ---------- Pinterest resolver (v2.2.0) ----------
+// ---------- Pinterest resolver (v2.2.0, hardened in v2.4.0) ----------
 // Resolves a pin.it short link or a pinterest.com pin URL to a direct video file on an approved media host.
 // Page fetching is restricted to RESOLVER_HOSTS; the returned media URL must pass MEDIA_HOSTS validation,
 // so fetch_chunk / probe_media / relay_media can never be pointed at a Pinterest HTML page.
 const PIN_ID_RE = /\/pin\/(?:[^/?#]*--)?(\d{5,25})(?:[/?#]|$)/;
 const VIDEO_URL_RE = /\.(mp4|mov|webm)(?:[?#].*)?$/i;   // progressive files only; HLS/DASH manifests are excluded
+const NEXT_PARAMS = ["next", "return_to", "redirect_uri", "continue", "url"];
 
 function metaContent(html, prop) {
   const p = prop.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const m = new RegExp(`<meta[^>]+(?:property|name)=["']${p}["'][^>]*?content=["']([^"']*)["']`, "i").exec(html)
     || new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]*?(?:property|name)=["']${p}["']`, "i").exec(html);
   return m ? stripHtml(m[1]) : null;
+}
+
+// Pin id from a URL path, or from a login/consent wrapper such as /login/?next=%2Fpin%2F123%2F (parsed only, never fetched).
+function pinIdFromUrl(raw, depth = 0) {
+  let u; try { u = new URL(raw); } catch { return null; }
+  const m = PIN_ID_RE.exec(u.pathname);
+  if (m) return m[1];
+  if (depth < 2) for (const k of NEXT_PARAMS) {
+    const v = u.searchParams.get(k);
+    if (v) { const id = pinIdFromUrl(v.startsWith("/") ? "https://www.pinterest.com" + v : v, depth + 1); if (id) return id; }
+  }
+  return null;
+}
+
+function canonicalHref(html) {
+  const m = /<link[^>]+rel=["']canonical["'][^>]*?href=["']([^"']*)["']/i.exec(html)
+    || /<link[^>]+href=["']([^"']*)["'][^>]*?rel=["']canonical["']/i.exec(html);
+  return m ? m[1] : null;
+}
+
+// Pin id declared by the page itself (canonical / og:url / app links). Only the page's OWN identity tags are used, never a
+// scan of the body, so related or recommended pins cannot be mistaken for the requested one. Ambiguous -> null.
+function pinIdFromHtml(html) {
+  const ids = new Set();
+  for (const raw of [canonicalHref(html), metaContent(html, "og:url"), metaContent(html, "al:ios:url"), metaContent(html, "al:android:url")]) {
+    if (!raw) continue;
+    const m = /pin\/(?:[^/?#]*--)?(\d{5,25})/.exec(raw);
+    if (m) ids.add(m[1]);
+  }
+  return ids.size === 1 ? [...ids][0] : null;
+}
+
+function describeNonPin(finalUrl, trace) {
+  let kind = "other page", where = "?";
+  try {
+    const u = new URL(finalUrl); where = u.hostname + u.pathname;
+    const seg = u.pathname.split("/").filter(Boolean);
+    if (/^(login|signup|auth)/i.test(seg[0] || "")) kind = "login/consent wall";
+    else if (/^(search|ideas|topics)$/i.test(seg[0] || "")) kind = "search/ideas page";
+    else if (seg.length === 1) kind = "profile";
+    else if (seg.length >= 2) kind = "board or board section";
+  } catch {}
+  return `redirect chain ended at ${where} (${kind}), which has no /pin/<id>. Chain: ${trace.join(" > ")}. Boards, profiles and search pages are not supported.`;
 }
 
 function jsonScriptBlocks(html) {
@@ -356,24 +406,30 @@ function firstText(...vals) {
   return null;
 }
 
-async function resolvePinterest(env, { url }) {
-  const start = validateUrl(url, RESOLVER_HOSTS);
-  const ua = env?.PINTEREST_USER_AGENT || UA;
+// Fetches the page behind a pin.it / pinterest.com URL and works out which pin it is. Throws a descriptive unsupported_url
+// (with the redirect chain) when the link does not lead to a single pin.
+async function fetchPinPage(env, start) {
+  const ua = env?.PINTEREST_USER_AGENT || UA, trace = [];
   const { res, finalUrl } = await guardedFetch(start.toString(),
     { headers: { "User-Agent": ua, Accept: "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.8" } },
-    RESOLVER_HOSTS, TIMEOUT_MS, RESOLVER_MAX_REDIRECTS);
+    RESOLVER_HOSTS, TIMEOUT_MS, RESOLVER_MAX_REDIRECTS, trace);
   const drop = () => { try { res.body?.cancel(); } catch {} };
   if (res.status === 404 || res.status === 410) { drop(); throw new BridgeError("pin_not_found", "pin not found or deleted"); }
   if (res.status === 401 || res.status === 403) { drop(); throw new BridgeError("pin_unavailable", "pin is private, restricted, or blocked the request (HTTP " + res.status + ")"); }
   if (res.status === 429) { drop(); throw new BridgeError("rate_limited", "Pinterest rate limit reached"); }
   if (!res.ok) { drop(); throw new BridgeError("upstream_error", "Pinterest returned HTTP " + res.status); }
-
-  const idm = PIN_ID_RE.exec(new URL(finalUrl).pathname);
-  if (!idm) { drop(); throw new BridgeError("unsupported_url", "URL does not resolve to a pin (/pin/<id>); boards, profiles and search pages are not supported"); }
-  const pinId = idm[1];
   if (!/^text\/html/i.test(res.headers.get("content-type") ?? "")) { drop(); throw new BridgeError("unsupported_page", "Pinterest did not return an HTML page"); }
 
+  let pinId = pinIdFromUrl(finalUrl);                       // 1) path, or a login wrapper's next= param
   const html = new TextDecoder().decode(await readLimited(res, PIN_HTML_MAX));
+  if (!pinId) pinId = pinIdFromHtml(html);                  // 2) the page's own canonical / og:url / app link
+  if (!pinId) throw new BridgeError("unsupported_url", describeNonPin(finalUrl, trace));
+  return { pinId, html };
+}
+
+async function resolvePinterest(env, { url }) {
+  const start = validateUrl(url, RESOLVER_HOSTS);
+  const { pinId, html } = await fetchPinPage(env, start);
   const { pin, videoList } = locatePin(jsonScriptBlocks(html), pinId);
   const ogVideo = metaContent(html, "og:video:secure_url") || metaContent(html, "og:video:url") || metaContent(html, "og:video");
   const ogTitle = metaContent(html, "og:title"), ogImage = metaContent(html, "og:image");

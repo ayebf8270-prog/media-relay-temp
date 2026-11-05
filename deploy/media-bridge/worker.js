@@ -1,4 +1,6 @@
-// media-bridge v2.4.0 - secure MCP server for The Hidden Why media retrieval.
+// media-bridge v2.4.1 - secure MCP server for The Hidden Why media retrieval.
+// v2.4.1: when a redirect chain passes through exactly one /pin/<id> but ends elsewhere (Pinterest sometimes bounces a pin's
+// /sent/ share page to the home page), the canonical https://www.pinterest.com/pin/<id>/ page is fetched once instead.
 // v2.4.0 hardens resolve_pinterest: redirect-chain tracing, descriptive unsupported_url errors (board / profile / login wall),
 // login-wall ?next= unwrapping, and a pin-id fallback from the page's own canonical / og:url / app-link tags.
 // v2.3.0 adds generate_image: calls the Hugging Face Space mcp-tools/Z-Image-Turbo through its Gradio API
@@ -14,7 +16,7 @@
 // HF_TOKEN (optional, Hugging Face read token: gives generate_image your own ZeroGPU quota).
 // Never put secrets in this file.
 
-const VERSION = "2.4.0";
+const VERSION = "2.4.1";
 const CHUNK_DEFAULT = 65536;
 const CHUNK_MAX = 98304;
 const MAX_FILE_BYTES = 250 * 1024 * 1024;
@@ -408,9 +410,9 @@ function firstText(...vals) {
 
 // Fetches the page behind a pin.it / pinterest.com URL and works out which pin it is. Throws a descriptive unsupported_url
 // (with the redirect chain) when the link does not lead to a single pin.
-async function fetchPinPage(env, start) {
-  const ua = env?.PINTEREST_USER_AGENT || UA, trace = [];
-  const { res, finalUrl } = await guardedFetch(start.toString(),
+async function fetchPinPageOnce(env, startUrl, trace) {
+  const ua = env?.PINTEREST_USER_AGENT || UA;
+  const { res, finalUrl } = await guardedFetch(startUrl,
     { headers: { "User-Agent": ua, Accept: "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.8" } },
     RESOLVER_HOSTS, TIMEOUT_MS, RESOLVER_MAX_REDIRECTS, trace);
   const drop = () => { try { res.body?.cancel(); } catch {} };
@@ -425,6 +427,27 @@ async function fetchPinPage(env, start) {
   if (!pinId) pinId = pinIdFromHtml(html);                  // 2) the page's own canonical / og:url / app link
   if (!pinId) throw new BridgeError("unsupported_url", describeNonPin(finalUrl, trace));
   return { pinId, html };
+}
+
+// v2.4.1: if the chain passed through exactly one /pin/<id> hop but ended on a page without a pin (e.g. Pinterest redirecting
+// /pin/<id>/sent/ to the home page), fetch the canonical pin page once. The URL is rebuilt from the numeric id on the fixed
+// host www.pinterest.com, never from the redirect target, so no new host can be reached.
+async function fetchPinPage(env, start) {
+  const trace = [];
+  try { return await fetchPinPageOnce(env, start.toString(), trace); }
+  catch (e) {
+    if (!(e instanceof BridgeError) || e.code !== "unsupported_url") throw e;
+    const ids = new Set();
+    for (const hop of trace) { const m = PIN_ID_RE.exec(hop.split(" ")[1] || ""); if (m) ids.add(m[1]); }
+    if (ids.size !== 1) throw e;
+    const direct = `https://www.pinterest.com/pin/${[...ids][0]}/`;
+    if (direct === start.toString()) throw e;
+    try { return await fetchPinPageOnce(env, direct, []); }
+    catch (e2) {
+      if (e2 instanceof BridgeError && e2.code === "unsupported_url") throw new BridgeError("unsupported_url", e.message + " Retrying the canonical pin page also failed: " + e2.message);
+      throw e2;
+    }
+  }
 }
 
 async function resolvePinterest(env, { url }) {

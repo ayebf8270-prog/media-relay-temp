@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Deploys deploy/media-bridge/worker.js (v2.4.0) to the existing Cloudflare Worker via the API.
+# Deploys deploy/media-bridge/worker.js (v2.4.1) to the existing Cloudflare Worker via the API.
 # PUT /content replaces code only: bindings, secrets, variables and settings are not modified.
 # Safety: guards before the upload; bindings/settings compared before and after; live code verified afterwards;
-# automatic rollback to the known-good previous version (rollback-v2.3.0.js) if anything fails after the upload starts.
+# automatic rollback to the known-good previous version (rollback-v2.4.0.js) if anything fails after the upload starts.
 set -uo pipefail
 : "${CF_TOKEN:?missing}"
 SCRIPT_NAME="${SCRIPT_NAME:-media-bridge}"
-EXPECT_VERSION="${EXPECT_VERSION:-2.4.0}"
-ROLLBACK_VERSION="${ROLLBACK_VERSION:-2.3.0}"
+EXPECT_VERSION="${EXPECT_VERSION:-2.4.1}"
+ROLLBACK_VERSION="${ROLLBACK_VERSION:-2.4.0}"
 CF_API="${CF_API:-https://api.cloudflare.com/client/v4}"
 SRC="${SRC:-deploy/media-bridge/worker.js}"
-ROLLBACK_SRC="${ROLLBACK_SRC:-deploy/media-bridge/rollback-v2.3.0.js}"
+ROLLBACK_SRC="${ROLLBACK_SRC:-deploy/media-bridge/rollback-v2.4.0.js}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-5}"
 OLD_TOOLS="hello search_commons commons_info search_archive archive_files search_pexels search_pixabay probe_media fetch_chunk relay_media relay_cleanup resolve_pinterest generate_image"
 NEW_TOOLS=""

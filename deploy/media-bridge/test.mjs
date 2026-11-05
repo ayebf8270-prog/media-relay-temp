@@ -1,4 +1,4 @@
-// Regression + behaviour tests for media-bridge v2.4.0. Offline: every network call is stubbed.
+// Regression + behaviour tests for media-bridge v2.4.1. Offline: every network call is stubbed.
 // Usage: NEW=/path/new.mjs OLD=/path/old.mjs node test.mjs
 import { pathToFileURL } from "node:url";
 import assert from "node:assert/strict";
@@ -32,12 +32,12 @@ const OLD_NAMES = ["hello","search_commons","commons_info","search_archive","arc
 noNetwork();
 const oldList = (await rpc(OLD, { jsonrpc: "2.0", id: 1, method: "tools/list" })).result.tools;
 const newList = (await rpc(NEW, { jsonrpc: "2.0", id: 1, method: "tools/list" })).result.tools;
-assert.deepEqual(oldList.map(t => t.name), OLD_NAMES); ok("previous worker (v2.3.0) exposes the 13 known tools");
+assert.deepEqual(oldList.map(t => t.name), OLD_NAMES); ok("previous worker (v2.4.0) exposes the 13 known tools");
 assert.deepEqual(newList.map(t => t.name), OLD_NAMES); ok("new worker = the same 13 tools in the same order");
 for (const t of oldList) assert.deepEqual(JSON.parse(JSON.stringify(newList.find(x => x.name === t.name))), JSON.parse(JSON.stringify(t)), "definition changed: " + t.name);
 ok("every existing tool definition (name, description, input schema) is byte-for-byte equivalent");
 const init = (await rpc(NEW, { jsonrpc: "2.0", id: 1, method: "initialize" })).result;
-assert.equal(init.serverInfo.version, "2.4.0"); ok("initialize reports 2.4.0");
+assert.equal(init.serverInfo.version, "2.4.1"); ok("initialize reports 2.4.1");
 assert.equal(textOf(await callTool(NEW, "hello", {})), textOf(await callTool(OLD, "hello", {}))); ok("hello unchanged");
 
 // ---- 2. access control and host allowlists behave identically for existing tools ----
@@ -116,9 +116,8 @@ for (const m of [OLD, NEW]) { const r = await resolve(m, "https://pin.it/ok"); a
 ok("REGRESSION: the pin.it -> /pin/<id>/sent/ shape resolves identically on the previous and the new worker");
 
 net({ "https://pin.it/c": redir("https://www.pinterest.com/some/thing/"), "https://www.pinterest.com/some/thing/": { body: page(PIN) }, ...probeOk });
-assert.equal((await resolve(OLD, "https://pin.it/c")).error?.error, "unsupported_url");
-assert.equal((await resolve(NEW, "https://pin.it/c")).pin_id, PIN);
-ok("NEW: non-pin final URL whose page canonical names exactly one pin now resolves (previously unsupported_url)");
+for (const m of [OLD, NEW]) assert.equal((await resolve(m, "https://pin.it/c")).pin_id, PIN);
+ok("non-pin final URL whose page canonical names exactly one pin resolves (v2.4.0 behaviour preserved)");
 
 const wall = `https://www.pinterest.com/login/?next=%2Fpin%2F${PIN}%2F`;
 net({ "https://pin.it/l": redir(wall), [wall]: { body: page(PIN) }, ...probeOk });
@@ -138,6 +137,29 @@ ok("SAFETY: off-allowlist redirects and http are still refused");
 net({ [`https://www.pinterest.com/pin/${PIN}/`]: { status: 403 } }); assert.equal((await resolve(NEW, `https://www.pinterest.com/pin/${PIN}/`)).error.error, "pin_unavailable");
 net({ [`https://www.pinterest.com/pin/${PIN}/`]: { status: 404 } }); assert.equal((await resolve(NEW, `https://www.pinterest.com/pin/${PIN}/`)).error.error, "pin_not_found");
 ok("error mapping unchanged: 403 -> pin_unavailable, 404 -> pin_not_found");
+
+
+// ---- 5. v2.4.1: chain passes through /pin/<id>/sent/ but Pinterest bounces that page to the home page (the real link-2 shape) ----
+const PIN2 = "1086986060095718307", HOME = "https://www.pinterest.com/";
+const bounce = { "https://pin.it/s": redir(`https://api.pinterest.com/url_shortener/s/redirect/`), "https://api.pinterest.com/url_shortener/s/redirect/": { status: 301, headers: { location: `https://www.pinterest.com/pin/${PIN2}/sent/?invite_code=zzz` } },
+  [`https://www.pinterest.com/pin/${PIN2}/sent/?invite_code=zzz`]: { status: 301, headers: { location: HOME } }, [HOME]: { body: "<html>home</html>" } };
+net({ ...bounce, [`https://www.pinterest.com/pin/${PIN2}/`]: { body: page(PIN2) }, ...probeOk });
+let r4 = await resolve(OLD, "https://pin.it/s"); assert.equal(r4.error?.error, "unsupported_url");
+r4 = await resolve(NEW, "https://pin.it/s"); assert.equal(r4.pin_id, PIN2); assert.equal(r4.video.url, VID);
+ok("NEW: /sent/ bounced to the home page -> the pin id from the chain is used to fetch the canonical pin page (previous worker: unsupported_url)");
+
+net({ ...bounce, [`https://www.pinterest.com/pin/${PIN2}/`]: redir(HOME) });
+e = (await resolve(NEW, "https://pin.it/s")).error; assert.equal(e.error, "unsupported_url"); assert.match(e.message, /Retrying the canonical pin page also failed/); assert.ok(!e.message.includes("zzz"));
+ok("canonical retry that also fails still reports unsupported_url with the full chain (no query string)");
+
+net({ ...bounce, [`https://www.pinterest.com/pin/${PIN2}/`]: { body: "<html>no pin data</html>" } });
+assert.equal((await resolve(NEW, "https://pin.it/s")).error.error, "pin_unavailable"); ok("canonical page loads but holds no pin data -> pin_unavailable (not a silent success)");
+net({ ...bounce, [`https://www.pinterest.com/pin/${PIN2}/`]: { status: 404 } });
+assert.equal((await resolve(NEW, "https://pin.it/s")).error.error, "pin_not_found"); ok("canonical retry on a deleted pin -> pin_not_found");
+
+let calls = 0; globalThis.fetch = async u => { calls++; throw new Error("unexpected network call: " + u); };
+net({ "https://pin.it/b2": redir("https://www.pinterest.com/user/board/"), "https://www.pinterest.com/user/board/": { body: "<html>board</html>" } });
+assert.equal((await resolve(NEW, "https://pin.it/b2")).error.error, "unsupported_url"); ok("a board link (no pin id anywhere in the chain) makes no retry request");
 
 globalThis.fetch = realFetch;
 console.log(`\nALL ${passed} TESTS PASSED`);
