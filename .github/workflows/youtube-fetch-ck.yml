@@ -1,0 +1,104 @@
+name: youtube-fetch-ck
+on:
+  push:
+    branches: [fetch/youtube-ck]
+    paths: ["youtube-urls.txt"]
+concurrency:
+  group: youtube-fetch-ck
+  cancel-in-progress: false
+permissions:
+  contents: write
+env:
+  GH_REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+  YT_COOKIES: ${{ secrets.YT_COOKIES }}
+  MAXH: "1080"
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yt-dlp
+        run: |
+          python3 -m pip install -q -U "yt-dlp[default]" && yt-dlp --version
+          node --version
+      - name: Prepare cookies (YouTube/Google only, never printed)
+        run: |
+          python3 - <<'PY'
+          import os
+          raw = os.environ.get("YT_COOKIES", "")
+          keep = ["# Netscape HTTP Cookie File"]; names = set()
+          for line in raw.splitlines():
+              l = line.rstrip("\r")
+              if not l.strip(): continue
+              p = l.split("\t")
+              if len(p) < 7: p = l.split(None, 6)
+              if len(p) < 7: continue
+              dom = p[0].replace("#HttpOnly_", "").lstrip(".").lower()
+              if dom in ("youtube.com", "google.com", "accounts.google.com") or dom.endswith(".youtube.com"):
+                  keep.append("\t".join(p)); names.add(p[5])
+          open("cookies.txt", "w").write("\n".join(keep) + "\n"); os.chmod("cookies.txt", 0o600)
+          print("secret present:", bool(raw), "| cookie lines kept:", len(keep) - 1)
+          print("login cookies present:", {n: n in names for n in ["SID", "SAPISID", "__Secure-3PSID", "LOGIN_INFO"]})
+          PY
+      - name: Download (every URL independent, client fallback)
+        run: |
+          set +e
+          mkdir -p out; : > out/status.txt
+          CLIENTSETS=("" "youtube:player_client=tv,web_safari" "youtube:player_client=mweb" "youtube:player_client=web_embedded,tv")
+          while read -r id; do
+            [ -z "$id" ] && continue; case "$id" in \#*) continue;; esac
+            url="https://www.youtube.com/watch?v=$id"; ok=0; n=0
+            for ea in "${CLIENTSETS[@]}"; do
+              n=$((n+1)); EA=(); [ -n "$ea" ] && EA=(--extractor-args "$ea")
+              yt-dlp --cookies cookies.txt --js-runtimes node "${EA[@]}" --no-playlist -F "$url" > "out/$id.formats.$n.txt" 2>&1
+              if grep -qE "^[0-9a-z_-]+ +(mp4|webm|m4a)" "out/$id.formats.$n.txt"; then
+                cp "out/$id.formats.$n.txt" "out/$id.formats.txt"
+                yt-dlp --cookies cookies.txt --js-runtimes node "${EA[@]}" --no-playlist --write-info-json -o "out/%(id)s.video.%(format_id)s.%(ext)s" -o "infojson:out/%(id)s" -f "bv*[height<=${MAXH}]/b[height<=${MAXH}]" "$url" > "out/$id.video.log" 2>&1; v=$?
+                yt-dlp --cookies cookies.txt --js-runtimes node "${EA[@]}" --no-playlist -o "out/%(id)s.audio.%(format_id)s.%(ext)s" -f "ba/b" "$url" > "out/$id.audio.log" 2>&1; a=$?
+                echo "$id clientset=$n video=$v audio=$a" >> out/status.txt
+                [ $v -eq 0 ] && [ $a -eq 0 ] && ok=1 && break
+              else
+                echo "$id clientset=$n formats-failed" >> out/status.txt
+              fi
+            done
+            [ $ok -eq 0 ] && echo "$id FAILED all client sets" >> out/status.txt
+          done < youtube-urls.txt
+          ls -la out
+      - name: Scrub logs of any cookie value, delete cookie file
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os, glob
+          vals = set()
+          for l in open("cookies.txt") if os.path.exists("cookies.txt") else []:
+              p = l.rstrip("\n").split("\t")
+              if len(p) >= 7 and len(p[6]) >= 6: vals.add(p[6])
+          for line in os.environ.get("YT_COOKIES", "").splitlines():
+              p = line.rstrip("\r").split("\t")
+              if len(p) >= 7 and len(p[6]) >= 6: vals.add(p[6])
+          n = 0
+          for f in glob.glob("out/*.txt") + glob.glob("out/*.log") + glob.glob("out/*.info.json"):
+              t = open(f, errors="replace").read(); o = t
+              for v in sorted(vals, key=len, reverse=True): t = t.replace(v, "[redacted]")
+              if t != o: n += 1; open(f, "w").write(t)
+          print("files scrubbed:", n)
+          PY
+          shred -u cookies.txt 2>/dev/null || rm -f cookies.txt
+      - name: Publish logs and results
+        if: always()
+        run: |
+          set +e
+          ls -la out > out/ls.txt
+          gh release create "ytck-${GITHUB_RUN_ID}" --prerelease --title "ytck-${GITHUB_RUN_ID}" --notes tmp $(ls out/*.txt out/*.log out/*.info.json 2>/dev/null) 2>&1 | tee out/publish.log
+      - name: Upload media files
+        if: always()
+        run: |
+          set +e
+          for f in out/*.mp4 out/*.webm out/*.m4a; do
+            [ -s "$f" ] || continue
+            echo "uploading $f" | tee -a out/upload.log
+            gh release upload "ytck-${GITHUB_RUN_ID}" "$f" --clobber 2>&1 | tee -a out/upload.log
+          done
+          gh release upload "ytck-${GITHUB_RUN_ID}" out/upload.log --clobber 2>&1
