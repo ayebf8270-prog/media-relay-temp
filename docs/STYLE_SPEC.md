@@ -370,3 +370,48 @@ Rules for assembling a full video **[E from §6]**
 - **Rendering target:** 1920×1080 @ 30 fps, sRGB. HTML/CSS + a frame-accurate renderer (e.g. HyperFrames-style HTML→MP4) or After Effects/Motion with the tokens above.
 - **Verify against reference:** to check any frame, re-extract from `ytck-42528222758` with `ffmpeg -ss <t> -i sI66-RKy4VU.video.399.mp4 -frames:v 1` and compare color tokens with the table in §1.
 - **Rights:** use this spec for the *look*. Create all text, illustrations, props, icons and map data yourself or from properly licensed sources.
+
+## 10. Shot-type decision guide (2D / 2.5D / 3D / Motion Graphics–HUD / Hybrid)
+
+Added after the measurement pass. §10.1 is the production rule set; §10.2 and §10.3 map it onto what was measured in the reference.
+
+### 10.1 Rules
+
+| Type | Use when |
+|---|---|
+| **2D** | A flat image is sufficient for the shot. |
+| **2.5D** | The shot mainly needs depth, parallax and layered camera movement. |
+| **3D** | A real 3D object that can be rotated, relit and viewed from different angles will significantly strengthen the shot. |
+| **Motion Graphics / HUD** | Maps, data, systems, networks, interfaces, counters, indicators and technical visualizations. |
+| **Hybrid** | Usually the preferred approach: 3D object + 2D environment + HUD + particles. |
+
+Decision order: start at the cheapest type that works (2D or Motion Graphics), and escalate to 2.5D, 3D or Hybrid only when the shot's purpose needs depth or a rotatable object.
+
+### 10.2 How the reference maps onto these types
+
+| Reference element (§4–§6) | Closest type | Basis |
+|---|---|---|
+| T1 cold-open hall, locked 10 s then 6.5% push-in | **2.5D** | single illustrated plate with one-point perspective and a camera move **[E]**; the measured scale change was uniform with small x-drift **[M]** |
+| T2 CRT recreation, T3 silhouette montage | **2D** | flat illustrated plates with rim light, scanlines and vignette **[E]** |
+| T4 title, T5 chapter card, T6 HUD | **Motion Graphics / HUD** | typographic builds and the persistent HUD **[M]** |
+| T7 timeline, T8 info card, T9 schematic, T10 map, T11 counter | **Motion Graphics / HUD** | UI-style components, one new element every 1.6–2.7 s **[M]** |
+| Props: newsprint clipping, gavel, stamps | **2D** | flat vector props **[E]** |
+| Reveal beats (the glowing red box, globe with infection dots) | **Candidates for 3D or Hybrid** | I could not confirm whether these were rendered in 3D or drawn flat **[?]** |
+
+Takeaway: the reference is predominantly **2D + Motion Graphics/HUD**, with 2.5D used for establishing shots. Use 3D sparingly, for hero objects at reveal beats.
+
+### 10.3 Hybrid recipe, in the reference's visual language
+
+Layer order, back to front, using the spec's tokens:
+1. `--bg #020306` with the radial vignette (§3.3).
+2. 2D environment plate in the red-wash family (`#361519`–`#631C27`).
+3. 3D hero object, lit with a cool key light and a 2–3 px red rim light (`#AB3A47`), with a slow rotation or the ease-in push-in from §5.1.
+4. Particle layer, small red dots (§5.4), fading in over about 10–15 frames.
+5. HUD and labels (§3.2, §4.7): mono caps, one callout per 1.6–2.7 s.
+6. Effects last: ≈6 px red glow, optional scanlines.
+
+Keep the hard-cut rule (§5.2) and the one-accent-hue-per-beat rule (§1.4). The 3D render must match the palette: dark materials, one accent light, no bright saturated surfaces.
+
+### 10.4 Asset tooling
+
+The `scenario-3d` skill is enabled in your account (see your screenshot), and its own text says to generate a concept image first, then run image-to-3D. It depends on the Scenario MCP server, which is not connected in this chat. When a shot is classed as 3D or Hybrid, the pipeline is: concept image in this palette → image-to-3D → export GLB → light and render in the HTML or render step.
